@@ -15,12 +15,25 @@ SYSROOT ?= $(CURDIR)/sysroot
 INSTALL_DIR ?= /usr/local
 # single or posix; note that pthread support is still a work-in-progress.
 THREAD_MODEL ?= single
+# preview1 or preview2; the latter is not (yet) compatible with multithreading
+WASI_SNAPSHOT ?= preview1
 # dlmalloc or none
 MALLOC_IMPL ?= dlmalloc
 # yes or no
 BUILD_LIBC_TOP_HALF ?= yes
 # The directory where we will store intermediate artifacts.
 OBJDIR ?= build/$(TARGET_TRIPLE)
+# The directory where we store files and tools for generating WASI Preview 2 bindings
+BINDING_WORK_DIR ?= build/bindings
+# URL from which to retrieve the WIT files used to generate the WASI Preview 2 bindings
+WASI_CLI_URL ?= https://github.com/WebAssembly/wasi-cli/archive/refs/tags/v0.2.0-rc-2023-12-05.tar.gz
+# URL from which to retrieve the `wit-bindgen` command used to generate the WASI
+# Preview 2 bindings.
+#
+# TODO: Switch to bytecodealliance/wit-bindgen 0.17.0 once it's released (which
+# will include https://github.com/bytecodealliance/wit-bindgen/pull/804 and
+# https://github.com/bytecodealliance/wit-bindgen/pull/805, which we rely on)
+WIT_BINDGEN_URL ?= https://github.com/dicej/wit-bindgen/releases/download/wit-bindgen-cli-0.17.0-dicej-pre0/wit-bindgen-v0.17.0-dicej-pre0-x86_64-linux.tar.gz
 
 # When the length is no larger than this threshold, we consider the
 # overhead of bulk memory opcodes to outweigh the performance benefit,
@@ -35,11 +48,17 @@ BULK_MEMORY_THRESHOLD ?= 32
 # Set the default WASI target triple.
 TARGET_TRIPLE = wasm32-wasi
 
-# Threaded version necessitates a different traget, as objects from different
+# Threaded version necessitates a different target, as objects from different
 # targets can't be mixed together while linking.
 ifeq ($(THREAD_MODEL), posix)
 TARGET_TRIPLE = wasm32-wasi-threads
 endif
+
+ifeq ($(WASI_SNAPSHOT), preview2)
+TARGET_TRIPLE = wasm32-wasi-preview2
+endif
+
+BUILTINS_LIB ?= $(shell ${CC} --print-libgcc-file-name)
 
 # These variables describe the locations of various files and directories in
 # the source tree.
@@ -60,6 +79,16 @@ LIBC_BOTTOM_HALF_ALL_SOURCES = \
     $(shell find $(LIBC_BOTTOM_HALF_CLOUDLIBC_SRC) -name \*.c) \
     $(shell find $(LIBC_BOTTOM_HALF_SOURCES) -name \*.c))
 
+ifeq ($(WASI_SNAPSHOT), preview1)
+# Omit source files not relevant to WASI Preview 1.  As we introduce files
+# supporting `wasi-sockets` for `wasm32-wasi-preview2`, we'll add those files to
+# this list.
+LIBC_BOTTOM_HALF_OMIT_SOURCES := $(LIBC_BOTTOM_HALF_SOURCES)/preview2.c
+LIBC_BOTTOM_HALF_ALL_SOURCES := $(filter-out $(LIBC_BOTTOM_HALF_OMIT_SOURCES),$(LIBC_BOTTOM_HALF_ALL_SOURCES))
+# Omit preview2.h from include-all.c test.
+INCLUDE_ALL_CLAUSES := -not -name preview2.h
+endif
+
 # FIXME(https://reviews.llvm.org/D85567) - due to a bug in LLD the weak
 # references to a function defined in `chdir.c` only work if `chdir.c` is at the
 # end of the archive, but once that LLD review lands and propagates into LLVM
@@ -78,6 +107,7 @@ LIBWASI_EMULATED_SIGNAL_SOURCES = \
 LIBWASI_EMULATED_SIGNAL_MUSL_SOURCES = \
     $(LIBC_TOP_HALF_MUSL_SRC_DIR)/signal/psignal.c \
     $(LIBC_TOP_HALF_MUSL_SRC_DIR)/string/strsignal.c
+LIBDL_SOURCES = $(LIBC_TOP_HALF_MUSL_SRC_DIR)/misc/dl.c
 LIBC_BOTTOM_HALF_CRT_SOURCES = $(wildcard $(LIBC_BOTTOM_HALF_DIR)/crt/*.c)
 LIBC_TOP_HALF_DIR = libc-top-half
 LIBC_TOP_HALF_MUSL_DIR = $(LIBC_TOP_HALF_DIR)/musl
@@ -97,6 +127,7 @@ LIBC_TOP_HALF_MUSL_SOURCES = \
         misc/getopt.c \
         misc/getopt_long.c \
         misc/getsubopt.c \
+        misc/realpath.c \
         misc/uname.c \
         misc/nftw.c \
         errno/strerror.c \
@@ -377,12 +408,13 @@ LIBWASI_EMULATED_PROCESS_CLOCKS_OBJS = $(call objs,$(LIBWASI_EMULATED_PROCESS_CL
 LIBWASI_EMULATED_GETPID_OBJS = $(call objs,$(LIBWASI_EMULATED_GETPID_SOURCES))
 LIBWASI_EMULATED_SIGNAL_OBJS = $(call objs,$(LIBWASI_EMULATED_SIGNAL_SOURCES))
 LIBWASI_EMULATED_SIGNAL_MUSL_OBJS = $(call objs,$(LIBWASI_EMULATED_SIGNAL_MUSL_SOURCES))
+LIBDL_OBJS = $(call objs,$(LIBDL_SOURCES))
 LIBC_BOTTOM_HALF_CRT_OBJS = $(call objs,$(LIBC_BOTTOM_HALF_CRT_SOURCES))
 
 # These variables describe the locations of various files and
 # directories in the generated sysroot tree.
 SYSROOT_LIB := $(SYSROOT)/lib/$(TARGET_TRIPLE)
-SYSROOT_INC = $(SYSROOT)/include
+SYSROOT_INC = $(SYSROOT)/include/$(TARGET_TRIPLE)
 SYSROOT_SHARE = $(SYSROOT)/share/$(TARGET_TRIPLE)
 
 # Files from musl's include directory that we don't want to install in the
@@ -415,7 +447,6 @@ MUSL_OMIT_HEADERS += \
     "bits/shm.h" "bits/msg.h" "bits/ipc.h" "bits/ptrace.h" \
     "bits/statfs.h" \
     "sys/vfs.h" \
-    "sys/statvfs.h" \
     "syslog.h" "sys/syslog.h" \
     "wait.h" "sys/wait.h" \
     "ucontext.h" "sys/ucontext.h" \
@@ -443,7 +474,6 @@ MUSL_OMIT_HEADERS += \
     "netdb.h" \
     "resolv.h" \
     "pty.h" \
-    "dlfcn.h" \
     "setjmp.h" \
     "ulimit.h" \
     "sys/xattr.h" \
@@ -472,6 +502,57 @@ endif
 
 default: finish
 
+LIBC_SO_OBJS = $(patsubst %.o,%.pic.o,$(filter-out $(MUSL_PRINTSCAN_OBJS),$(LIBC_OBJS)))
+MUSL_PRINTSCAN_LONG_DOUBLE_SO_OBJS = $(patsubst %.o,%.pic.o,$(MUSL_PRINTSCAN_LONG_DOUBLE_OBJS))
+LIBWASI_EMULATED_MMAN_SO_OBJS = $(patsubst %.o,%.pic.o,$(LIBWASI_EMULATED_MMAN_OBJS))
+LIBWASI_EMULATED_PROCESS_CLOCKS_SO_OBJS = $(patsubst %.o,%.pic.o,$(LIBWASI_EMULATED_PROCESS_CLOCKS_OBJS))
+LIBWASI_EMULATED_GETPID_SO_OBJS = $(patsubst %.o,%.pic.o,$(LIBWASI_EMULATED_GETPID_OBJS))
+LIBWASI_EMULATED_SIGNAL_SO_OBJS = $(patsubst %.o,%.pic.o,$(LIBWASI_EMULATED_SIGNAL_OBJS))
+LIBWASI_EMULATED_SIGNAL_MUSL_SO_OBJS = $(patsubst %.o,%.pic.o,$(LIBWASI_EMULATED_SIGNAL_MUSL_OBJS))
+LIBDL_SO_OBJS = $(patsubst %.o,%.pic.o,$(LIBDL_OBJS))
+BULK_MEMORY_SO_OBJS = $(patsubst %.o,%.pic.o,$(BULK_MEMORY_OBJS))
+DLMALLOC_SO_OBJS = $(patsubst %.o,%.pic.o,$(DLMALLOC_OBJS))
+LIBC_BOTTOM_HALF_ALL_SO_OBJS = $(patsubst %.o,%.pic.o,$(LIBC_BOTTOM_HALF_ALL_OBJS))
+LIBC_TOP_HALF_ALL_SO_OBJS = $(patsubst %.o,%.pic.o,$(LIBC_TOP_HALF_ALL_OBJS))
+
+PIC_OBJS = \
+	$(LIBC_SO_OBJS) \
+	$(MUSL_PRINTSCAN_LONG_DOUBLE_SO_OBJS) \
+	$(LIBWASI_EMULATED_MMAN_SO_OBJS) \
+	$(LIBWASI_EMULATED_PROCESS_CLOCKS_SO_OBJS) \
+	$(LIBWASI_EMULATED_GETPID_SO_OBJS) \
+	$(LIBWASI_EMULATED_SIGNAL_SO_OBJS) \
+	$(LIBWASI_EMULATED_SIGNAL_MUSL_SO_OBJS) \
+	$(LIBDL_SO_OBJS) \
+	$(BULK_MEMORY_SO_OBJS) \
+	$(DLMALLOC_SO_OBJS) \
+	$(LIBC_BOTTOM_HALF_ALL_SO_OBJS) \
+	$(LIBC_TOP_HALF_ALL_SO_OBJS) \
+	$(LIBC_BOTTOM_HALF_CRT_OBJS)
+
+# TODO: Specify SDK version, e.g. libc.so.wasi-sdk-21, as SO_NAME once `wasm-ld`
+# supports it.
+#
+# Note that we collect the object files for each shared library into a .a and
+# link that using `--whole-archive` rather than pass the object files directly
+# to CC.  This is a workaround for a Windows command line size limitation.  See
+# the `%.a` rule below for details.
+$(SYSROOT_LIB)/%.so: $(OBJDIR)/%.so.a $(BUILTINS_LIB)
+	$(CC) --target=$(TARGET_TRIPLE) -nodefaultlibs -shared --sysroot=$(SYSROOT) \
+	-o $@ -Wl,--whole-archive $< -Wl,--no-whole-archive $(BUILTINS_LIB)
+
+$(OBJDIR)/libc.so.a: $(LIBC_SO_OBJS) $(MUSL_PRINTSCAN_LONG_DOUBLE_SO_OBJS)
+
+$(OBJDIR)/libwasi-emulated-mman.so.a: $(LIBWASI_EMULATED_MMAN_SO_OBJS)
+
+$(OBJDIR)/libwasi-emulated-process-clocks.so.a: $(LIBWASI_EMULATED_PROCESS_CLOCKS_SO_OBJS)
+
+$(OBJDIR)/libwasi-emulated-getpid.so.a: $(LIBWASI_EMULATED_GETPID_SO_OBJS)
+
+$(OBJDIR)/libwasi-emulated-signal.so.a: $(LIBWASI_EMULATED_SIGNAL_SO_OBJS) $(LIBWASI_EMULATED_SIGNAL_MUSL_SO_OBJS)
+
+$(OBJDIR)/libdl.so.a: $(LIBDL_SO_OBJS)
+
 $(SYSROOT_LIB)/libc.a: $(LIBC_OBJS)
 
 $(SYSROOT_LIB)/libc-printscan-long-double.a: $(MUSL_PRINTSCAN_LONG_DOUBLE_OBJS)
@@ -486,6 +567,8 @@ $(SYSROOT_LIB)/libwasi-emulated-getpid.a: $(LIBWASI_EMULATED_GETPID_OBJS)
 
 $(SYSROOT_LIB)/libwasi-emulated-signal.a: $(LIBWASI_EMULATED_SIGNAL_OBJS) $(LIBWASI_EMULATED_SIGNAL_MUSL_OBJS)
 
+$(SYSROOT_LIB)/libdl.a: $(LIBDL_OBJS)
+
 %.a:
 	@mkdir -p "$(@D)"
 	# On Windows, the commandline for the ar invocation got too long, so it needs to be split up.
@@ -497,6 +580,8 @@ $(SYSROOT_LIB)/libwasi-emulated-signal.a: $(LIBWASI_EMULATED_SIGNAL_OBJS) $(LIBW
 	# silently dropping the tail.
 	$(AR) crs $@ $(wordlist 800, 100000, $(sort $^))
 
+$(PIC_OBJS): CFLAGS += -fPIC -fvisibility=default
+
 $(MUSL_PRINTSCAN_OBJS): CFLAGS += \
 	    -D__wasilibc_printscan_no_long_double \
 	    -D__wasilibc_printscan_full_support_option="\"add -lc-printscan-long-double to the link command\""
@@ -507,14 +592,22 @@ $(MUSL_PRINTSCAN_NO_FLOATING_POINT_OBJS): CFLAGS += \
 
 # TODO: apply -mbulk-memory globally, once
 # https://github.com/llvm/llvm-project/issues/52618 is resolved
-$(BULK_MEMORY_OBJS): CFLAGS += \
+$(BULK_MEMORY_OBJS) $(BULK_MEMORY_SO_OBJS): CFLAGS += \
         -mbulk-memory
 
-$(BULK_MEMORY_OBJS): CFLAGS += \
+$(BULK_MEMORY_OBJS) $(BULK_MEMORY_SO_OBJS): CFLAGS += \
         -DBULK_MEMORY_THRESHOLD=$(BULK_MEMORY_THRESHOLD)
 
-$(LIBWASI_EMULATED_SIGNAL_MUSL_OBJS): CFLAGS += \
+$(LIBWASI_EMULATED_SIGNAL_MUSL_OBJS) $(LIBWASI_EMULATED_SIGNAL_MUSL_SO_OBJS): CFLAGS += \
 	    -D_WASI_EMULATED_SIGNAL
+
+$(OBJDIR)/%.long-double.pic.o: %.c include_dirs
+	@mkdir -p "$(@D)"
+	$(CC) $(CFLAGS) -MD -MP -o $@ -c $<
+
+$(OBJDIR)/%.pic.o: %.c include_dirs
+	@mkdir -p "$(@D)"
+	$(CC) $(CFLAGS) -MD -MP -o $@ -c $<
 
 $(OBJDIR)/%.long-double.o: %.c include_dirs
 	@mkdir -p "$(@D)"
@@ -534,17 +627,17 @@ $(OBJDIR)/%.o: %.s include_dirs
 
 -include $(shell find $(OBJDIR) -name \*.d)
 
-$(DLMALLOC_OBJS): CFLAGS += \
+$(DLMALLOC_OBJS) $(DLMALLOC_SO_OBJS): CFLAGS += \
     -I$(DLMALLOC_INC)
 
-startup_files $(LIBC_BOTTOM_HALF_ALL_OBJS): CFLAGS += \
+startup_files $(LIBC_BOTTOM_HALF_ALL_OBJS) $(LIBC_BOTTOM_HALF_ALL_SO_OBJS): CFLAGS += \
     -I$(LIBC_BOTTOM_HALF_HEADERS_PRIVATE) \
     -I$(LIBC_BOTTOM_HALF_CLOUDLIBC_SRC_INC) \
     -I$(LIBC_BOTTOM_HALF_CLOUDLIBC_SRC) \
     -I$(LIBC_TOP_HALF_MUSL_SRC_DIR)/include \
     -I$(LIBC_TOP_HALF_MUSL_SRC_DIR)/internal
 
-$(LIBC_TOP_HALF_ALL_OBJS) $(MUSL_PRINTSCAN_LONG_DOUBLE_OBJS) $(MUSL_PRINTSCAN_NO_FLOATING_POINT_OBJS) $(LIBWASI_EMULATED_SIGNAL_MUSL_OBJS): CFLAGS += \
+$(LIBC_TOP_HALF_ALL_OBJS) $(LIBC_TOP_HALF_ALL_SO_OBJS) $(MUSL_PRINTSCAN_LONG_DOUBLE_OBJS) $(MUSL_PRINTSCAN_LONG_DOUBLE_SO_OBJS) $(MUSL_PRINTSCAN_NO_FLOATING_POINT_OBJS) $(LIBWASI_EMULATED_SIGNAL_MUSL_OBJS) $(LIBWASI_EMULATED_SIGNAL_MUSL_SO_OBJS) $(LIBDL_OBJS) $(LIBDL_SO_OBJS): CFLAGS += \
     -I$(LIBC_TOP_HALF_MUSL_SRC_DIR)/include \
     -I$(LIBC_TOP_HALF_MUSL_SRC_DIR)/internal \
     -I$(LIBC_TOP_HALF_MUSL_DIR)/arch/wasm32 \
@@ -558,7 +651,7 @@ $(LIBC_TOP_HALF_ALL_OBJS) $(MUSL_PRINTSCAN_LONG_DOUBLE_OBJS) $(MUSL_PRINTSCAN_NO
     -Wno-dangling-else \
     -Wno-unknown-pragmas
 
-$(LIBWASI_EMULATED_PROCESS_CLOCKS_OBJS): CFLAGS += \
+$(LIBWASI_EMULATED_PROCESS_CLOCKS_OBJS) $(LIBWASI_EMULATED_PROCESS_CLOCKS_SO_OBJS): CFLAGS += \
     -I$(LIBC_BOTTOM_HALF_CLOUDLIBC_SRC)
 
 # emmalloc uses a lot of pointer type-punning, which is UB under strict aliasing,
@@ -596,6 +689,21 @@ startup_files: include_dirs $(LIBC_BOTTOM_HALF_CRT_OBJS)
 	mkdir -p "$(SYSROOT_LIB)" && \
 	cp $(LIBC_BOTTOM_HALF_CRT_OBJS) "$(SYSROOT_LIB)"
 
+# TODO: As of this writing, wasi_thread_start.s uses non-position-independent
+# code, and I'm not sure how to make it position-independent.  Once we've done
+# that, we can enable libc.so for the wasi-threads build.
+ifneq ($(THREAD_MODEL), posix)
+LIBC_SO = \
+	$(SYSROOT_LIB)/libc.so \
+	$(SYSROOT_LIB)/libwasi-emulated-mman.so \
+	$(SYSROOT_LIB)/libwasi-emulated-process-clocks.so \
+	$(SYSROOT_LIB)/libwasi-emulated-getpid.so \
+	$(SYSROOT_LIB)/libwasi-emulated-signal.so \
+	$(SYSROOT_LIB)/libdl.so
+endif
+
+libc_so: include_dirs $(LIBC_SO)
+
 libc: include_dirs \
     $(SYSROOT_LIB)/libc.a \
     $(SYSROOT_LIB)/libc-printscan-long-double.a \
@@ -603,13 +711,14 @@ libc: include_dirs \
     $(SYSROOT_LIB)/libwasi-emulated-mman.a \
     $(SYSROOT_LIB)/libwasi-emulated-process-clocks.a \
     $(SYSROOT_LIB)/libwasi-emulated-getpid.a \
-    $(SYSROOT_LIB)/libwasi-emulated-signal.a
+    $(SYSROOT_LIB)/libwasi-emulated-signal.a \
+    $(SYSROOT_LIB)/libdl.a
 
 finish: startup_files libc
 	#
 	# Create empty placeholder libraries.
 	#
-	for name in m rt pthread crypt util xnet resolv dl; do \
+	for name in m rt pthread crypt util xnet resolv; do \
 	    $(AR) crs "$(SYSROOT_LIB)/lib$${name}.a"; \
 	done
 
@@ -645,7 +754,7 @@ check-symbols: startup_files libc
 	for undef_sym in $$("$(NM)" --undefined-only "$(SYSROOT_LIB)"/libc.a "$(SYSROOT_LIB)"/libc-*.a "$(SYSROOT_LIB)"/*.o \
 	    |grep ' U ' |sed 's/.* U //' |LC_ALL=C sort |uniq); do \
 	    grep -q '\<'$$undef_sym'\>' "$(DEFINED_SYMBOLS)" || echo $$undef_sym; \
-	done | grep -v "^__mul" > "$(UNDEFINED_SYMBOLS)"
+	done | grep -E -v "^__mul|__memory_base" > "$(UNDEFINED_SYMBOLS)"
 	grep '^_*imported_wasi_' "$(UNDEFINED_SYMBOLS)" \
 	    > "$(SYSROOT_LIB)/libc.imports"
 
@@ -653,7 +762,7 @@ check-symbols: startup_files libc
 	# Generate a test file that includes all public C header files.
 	#
 	cd "$(SYSROOT_INC)" && \
-	  for header in $$(find . -type f -not -name mman.h -not -name signal.h -not -name times.h -not -name resource.h |grep -v /bits/ |grep -v /c++/); do \
+	  for header in $$(find . -type f -not -name mman.h -not -name signal.h -not -name times.h -not -name resource.h $(INCLUDE_ALL_CLAUSES) |grep -v /bits/ |grep -v /c++/); do \
 	      echo '#include <'$$header'>' | sed 's/\.\///' ; \
 	done |LC_ALL=C sort >$(SYSROOT_SHARE)/include-all.c ; \
 	cd - >/dev/null
@@ -678,6 +787,8 @@ check-symbols: startup_files libc
 	@# TODO: Filter out __NO_MATH_ERRNO_ and a few __*WIDTH__ that are new to clang 14.
 	@# TODO: Filter out __GCC_HAVE_SYNC_COMPARE_AND_SWAP_* that are new to clang 16.
 	@# TODO: Filter out __FPCLASS_* that are new to clang 17.
+	@# TODO: Filter out __FLT128_* that are new to clang 18.
+	@# TODO: Filter out __MEMORY_SCOPE_* that are new to clang 18.
 	@# TODO: clang defined __FLT_EVAL_METHOD__ until clang 15, so we force-undefine it
 	@# for older versions.
 	@# TODO: Undefine __wasm_mutable_globals__ and __wasm_sign_ext__, that are new to
@@ -710,6 +821,8 @@ check-symbols: startup_files libc
 	    | grep -v '^#define __\(BOOL\|INT_\(LEAST\|FAST\)\(8\|16\|32\|64\)\|INT\|LONG\|LLONG\|SHRT\)_WIDTH__' \
 	    | grep -v '^#define __GCC_HAVE_SYNC_COMPARE_AND_SWAP_\(1\|2\|4\|8\)' \
 	    | grep -v '^#define __FPCLASS_' \
+	    | grep -v '^#define __FLT128_' \
+	    | grep -v '^#define __MEMORY_SCOPE_' \
 	    | grep -v '^#define NDEBUG' \
 	    | grep -v '^#define __OPTIMIZE__' \
 	    | grep -v '^#define assert' \
@@ -724,8 +837,65 @@ install: finish
 	mkdir -p "$(INSTALL_DIR)"
 	cp -r "$(SYSROOT)/lib" "$(SYSROOT)/share" "$(SYSROOT)/include" "$(INSTALL_DIR)"
 
+$(BINDING_WORK_DIR)/wasi-cli:
+	mkdir -p "$(BINDING_WORK_DIR)"
+	cd "$(BINDING_WORK_DIR)" && \
+		curl -L "$(WASI_CLI_URL)" -o wasi-cli.tar.gz && \
+		tar xf wasi-cli.tar.gz && \
+		mv wasi-cli-* wasi-cli
+
+$(BINDING_WORK_DIR)/wit-bindgen:
+	mkdir -p "$(BINDING_WORK_DIR)"
+	cd "$(BINDING_WORK_DIR)" && \
+		curl -L "$(WIT_BINDGEN_URL)" -o wit-bindgen.tar.gz && \
+		tar xf wit-bindgen.tar.gz && \
+		mv wit-bindgen-* wit-bindgen
+
+bindings: $(BINDING_WORK_DIR)/wasi-cli $(BINDING_WORK_DIR)/wit-bindgen
+	cd "$(BINDING_WORK_DIR)" && \
+		./wit-bindgen/wit-bindgen c \
+			--rename-world preview2 \
+			--type-section-suffix __wasi_libc \
+			--world wasi:cli/imports@0.2.0-rc-2023-12-05 \
+			--rename wasi:clocks/monotonic-clock@0.2.0-rc-2023-11-10=monotonic_clock \
+			--rename wasi:clocks/wall-clock@0.2.0-rc-2023-11-10=wall_clock \
+			--rename wasi:filesystem/preopens@0.2.0-rc-2023-11-10=filesystem_preopens \
+			--rename wasi:filesystem/types@0.2.0-rc-2023-11-10=filesystem \
+			--rename wasi:io/error@0.2.0-rc-2023-11-10=io_error \
+			--rename wasi:io/poll@0.2.0-rc-2023-11-10=poll \
+			--rename wasi:io/streams@0.2.0-rc-2023-11-10=streams \
+			--rename wasi:random/insecure-seed@0.2.0-rc-2023-11-10=random_insecure_seed \
+			--rename wasi:random/insecure@0.2.0-rc-2023-11-10=random_insecure \
+			--rename wasi:random/random@0.2.0-rc-2023-11-10=random \
+			--rename wasi:sockets/instance-network@0.2.0-rc-2023-11-10=instance_network \
+			--rename wasi:sockets/ip-name-lookup@0.2.0-rc-2023-11-10=ip_name_lookup \
+			--rename wasi:sockets/network@0.2.0-rc-2023-11-10=network \
+			--rename wasi:sockets/tcp-create-socket@0.2.0-rc-2023-11-10=tcp_create_socket \
+			--rename wasi:sockets/tcp@0.2.0-rc-2023-11-10=tcp \
+			--rename wasi:sockets/udp-create-socket@0.2.0-rc-2023-11-10=udp_create_socket \
+			--rename wasi:sockets/udp@0.2.0-rc-2023-11-10=udp \
+			--rename wasi:cli/environment@0.2.0-rc-2023-12-05=environment \
+			--rename wasi:cli/exit@0.2.0-rc-2023-12-05=exit \
+			--rename wasi:cli/stdin@0.2.0-rc-2023-12-05=stdin \
+			--rename wasi:cli/stdout@0.2.0-rc-2023-12-05=stdout \
+			--rename wasi:cli/stderr@0.2.0-rc-2023-12-05=stderr \
+			--rename wasi:cli/terminal-input@0.2.0-rc-2023-12-05=terminal_input \
+			--rename wasi:cli/terminal-output@0.2.0-rc-2023-12-05=terminal_output \
+			--rename wasi:cli/terminal-stdin@0.2.0-rc-2023-12-05=terminal_stdin \
+			--rename wasi:cli/terminal-stdout@0.2.0-rc-2023-12-05=terminal_stdout \
+			--rename wasi:cli/terminal-stderr@0.2.0-rc-2023-12-05=terminal_stderr \
+			./wasi-cli/wit && \
+		mv preview2.h ../../libc-bottom-half/headers/public/wasi/ && \
+		mv preview2_component_type.o ../../libc-bottom-half/sources && \
+		sed 's_#include "preview2.h"_#include "wasi/preview2.h"_' \
+			< preview2.c \
+			> ../../libc-bottom-half/sources/preview2.c && \
+		rm preview2.c
+
+
 clean:
+	$(RM) -r "$(BINDING_WORK_DIR)"
 	$(RM) -r "$(OBJDIR)"
 	$(RM) -r "$(SYSROOT)"
 
-.PHONY: default startup_files libc finish install include_dirs clean
+.PHONY: default startup_files libc libc_so finish install include_dirs clean check-symbols bindings

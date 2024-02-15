@@ -75,6 +75,7 @@
 #include <crypt.h>
 #include <ctype.h>
 #include <dirent.h>
+#include <dlfcn.h>
 #include <endian.h>
 #include <err.h>
 #include <errno.h>
@@ -141,6 +142,7 @@
 #include <sys/select.h>
 #include <sys/socket.h>
 #include <sys/stat.h>
+#include <sys/statvfs.h>
 #include <sys/stropts.h>
 #include <sys/syscall.h>
 #include <sys/sysinfo.h>

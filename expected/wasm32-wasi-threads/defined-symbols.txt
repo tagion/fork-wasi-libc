@@ -511,6 +511,7 @@ cexp
 cexpf
 cexpl
 chdir
+chmod
 cimag
 cimagf
 cimagl
@@ -607,6 +608,8 @@ fabs
 fabsf
 fabsl
 faccessat
+fchmod
+fchmodat
 fclose
 fcntl
 fcvt
@@ -702,6 +705,7 @@ fsetpos
 fsetpos64
 fstat
 fstatat
+fstatvfs
 fsync
 ftell
 ftello
@@ -1080,6 +1084,7 @@ readlinkat
 readv
 realloc
 reallocarray
+realpath
 recv
 regcomp
 regerror
@@ -1162,6 +1167,7 @@ srand48
 srandom
 sscanf
 stat
+statvfs
 stderr
 stdin
 stdout
