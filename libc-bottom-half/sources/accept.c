@@ -1,51 +1,20 @@
-// SPDX-License-Identifier: BSD-2-Clause
-
-#include <sys/socket.h>
-
-#include <assert.h>
-#include <wasi/api.h>
 #include <errno.h>
-#include <string.h>
+#include <netinet/in.h>
+#include <wasi/descriptor_table.h>
 
-int accept(int socket, struct sockaddr *restrict addr, socklen_t *restrict addrlen) {
-  int ret = -1;
-
-  __wasi_errno_t error = __wasi_sock_accept(socket, 0, &ret);
-
-  if (error != 0) {
-    errno = error;
-    return -1;
-  }
-
-  // Clear sockaddr to indicate undefined address
-  memset(addr, 0, *addrlen);
-  // might be AF_UNIX or AF_INET
-  addr->sa_family = AF_UNSPEC;
-  *addrlen = sizeof(struct sockaddr);
-
-  return ret;
+int accept(int socket, struct sockaddr *restrict addr,
+           socklen_t *restrict addrlen) {
+  return accept4(socket, addr, addrlen, 0);
 }
 
-int accept4(int socket, struct sockaddr *restrict addr, socklen_t *restrict addrlen, int flags) {
-  int ret = -1;
-
-  if (flags & ~(SOCK_NONBLOCK | SOCK_CLOEXEC)) {
-    errno = EINVAL;
+int accept4(int socket, struct sockaddr *restrict addr,
+            socklen_t *restrict addrlen, int flags) {
+  descriptor_table_entry_t *entry = descriptor_table_get_ref(socket);
+  if (!entry)
+    return -1;
+  if (!entry->vtable->accept4) {
+    errno = EOPNOTSUPP;
     return -1;
   }
-
-  __wasi_errno_t error = __wasi_sock_accept(socket, (flags & SOCK_NONBLOCK) ? __WASI_FDFLAGS_NONBLOCK : 0, &ret);
-
-  if (error != 0) {
-    errno = error;
-    return -1;
-  }
-
-  // Clear sockaddr to indicate undefined address
-  memset(addr, 0, *addrlen);
-  // might be AF_UNIX or AF_INET
-  addr->sa_family = AF_UNSPEC;
-  *addrlen = sizeof(struct sockaddr);
-
-  return ret;
+  return entry->vtable->accept4(entry->data, addr, addrlen, flags);
 }

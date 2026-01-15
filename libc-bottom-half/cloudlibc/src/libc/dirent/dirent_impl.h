@@ -15,6 +15,7 @@ struct dirent;
 struct _DIR {
   // Directory file descriptor and cookie.
   int fd;
+#if defined(__wasip1__)
   __wasi_dircookie_t cookie;
 
   // Read buffer.
@@ -22,6 +23,17 @@ struct _DIR {
   size_t buffer_processed;
   size_t buffer_size;
   size_t buffer_used;
+#elif defined(__wasip2__)
+  filesystem_own_directory_entry_stream_t stream;
+  size_t skip;
+  size_t offset;
+#elif defined(__wasip3__)
+  filesystem_stream_directory_entry_t stream;
+  size_t skip;
+  size_t offset;
+#else
+# error "Unknown WASI version"
+#endif
 
   // Object returned by readdir().
   struct dirent *dirent;

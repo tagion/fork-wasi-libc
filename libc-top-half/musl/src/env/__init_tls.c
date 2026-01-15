@@ -13,7 +13,9 @@
 #include "atomic.h"
 #include "syscall.h"
 
+#if defined(__wasilibc_unmodified_upstream) || defined(_REENTRANT)
 volatile int __thread_list_lock;
+#endif
 
 #ifndef __wasilibc_unmodified_upstream
 
@@ -25,31 +27,51 @@ volatile int __thread_list_lock;
  * TODO: remove usage of __heap_base/__data_end for stack size calculation
  * once we drop support for LLVM v15 and older.
  */
+#if !defined(__pic__)
 extern unsigned char __heap_base;
 extern unsigned char __data_end;
 extern unsigned char __global_base;
+#endif
 extern weak unsigned char __stack_high;
 extern weak unsigned char __stack_low;
 
-static inline void setup_default_stack_size()
-{
-	ptrdiff_t stack_size;
+struct stack_bounds {
+	void *base;
+	size_t size;
+};
 
-	if (&__stack_high)
-		stack_size = &__stack_high - &__stack_low;
-	else {
+static inline struct stack_bounds get_stack_bounds()
+{
+	struct stack_bounds bounds;
+
+	if (&__stack_high) {
+		bounds.base = &__stack_high;
+		bounds.size = &__stack_high - &__stack_low;
+	} else {
+		/* For non-pic, make a guess using the knowledge about
+		 * how wasm-ld lays out things. For pic, just give up.
+		 */
+#if !defined(__pic__)
 		unsigned char *sp;
 		__asm__(
 			".globaltype __stack_pointer, i32\n"
 			"global.get __stack_pointer\n"
 			"local.set %0\n"
 			: "=r"(sp));
-		stack_size = sp > &__global_base ? &__heap_base - &__data_end : (ptrdiff_t)&__global_base;
+		if (sp > &__global_base) {
+			bounds.base = &__heap_base;
+			bounds.size = &__heap_base - &__data_end;
+		} else {
+			bounds.base = &__global_base;
+			bounds.size = (size_t)&__global_base;
+		}
+#else
+		bounds.base = 0;
+		bounds.size = 0;
+#endif
 	}
 
-	__default_stacksize =
-		stack_size < DEFAULT_STACK_MAX ?
-		stack_size : DEFAULT_STACK_MAX;
+	return bounds;
 }
 
 void __wasi_init_tp() {
@@ -68,7 +90,14 @@ int __init_tp(void *p)
 	td->detach_state = DT_JOINABLE;
 	td->tid = __syscall(SYS_set_tid_address, &__thread_list_lock);
 #else
-	setup_default_stack_size();
+	struct stack_bounds bounds = get_stack_bounds();
+	__default_stacksize =
+		bounds.size < DEFAULT_STACK_MAX ?
+		bounds.size : DEFAULT_STACK_MAX;
+	td->stack = bounds.base;
+	td->stack_size = bounds.size;
+	td->guard_size = 0;
+#ifdef _REENTRANT
 	td->detach_state = DT_JOINABLE;
 	/*
 	 * Initialize the TID to a value which doesn't conflict with
@@ -82,8 +111,11 @@ int __init_tp(void *p)
 	 */
 	td->tid = 0x3fffffff;
 #endif
+#endif
+#if defined(__wasilibc_unmodified_upstream) || defined(_REENTRANT)
 	td->locale = &libc.global_locale;
 	td->robust_list.head = &td->robust_list.head;
+#endif
 	td->sysinfo = __sysinfo;
 	td->next = td->prev = td;
 	return 0;
@@ -105,6 +137,7 @@ static struct tls_module main_tls;
 extern void __wasm_init_tls(void*);
 #endif
 
+#if defined(__wasilibc_unmodified_upstream) || defined(_REENTRANT)
 void *__copy_tls(unsigned char *mem)
 {
 #ifdef __wasilibc_unmodified_upstream
@@ -151,6 +184,7 @@ void *__copy_tls(unsigned char *mem)
 	return mem;
 #endif
 }
+#endif /* defined(__wasilibc_unmodified_upstream) || defined(_REENTRANT) */
 
 #ifdef __wasilibc_unmodified_upstream
 #if ULONG_MAX == 0xffffffff

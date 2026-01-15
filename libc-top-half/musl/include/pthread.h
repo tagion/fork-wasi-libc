@@ -77,12 +77,22 @@ extern "C" {
 #define PTHREAD_NULL ((pthread_t)0)
 
 
+#ifdef __wasilibc_unmodified_upstream
 int pthread_create(pthread_t *__restrict, const pthread_attr_t *__restrict, void *(*)(void *), void *__restrict);
 int pthread_detach(pthread_t);
-#ifdef __wasilibc_unmodified_upstream
 _Noreturn void pthread_exit(void *);
-#endif
 int pthread_join(pthread_t, void **);
+#else
+#if defined(_REENTRANT) || !defined(_WASI_STRICT_PTHREAD)
+int pthread_create(pthread_t *__restrict, const pthread_attr_t *__restrict, void *(*)(void *), void *__restrict);
+int pthread_detach(pthread_t);
+int pthread_join(pthread_t, void **);
+#else
+#define pthread_create(...) ({ _Static_assert(0, "This function is not available on a single-threaded target; switch to a multi-threaded target with -pthread or enable a stub implementation by undefining _WASI_STRICT_PTHREAD"); 0;})
+#define pthread_detach(...) ({ _Static_assert(0, "This function is not available on a single-threaded target; switch to a multi-threaded target with -pthread or enable a stub implementation by undefining _WASI_STRICT_PTHREAD"); 0;})
+#define pthread_join(...) ({ _Static_assert(0, "This function is not available on a single-threaded target; switch to a multi-threaded target with -pthread or enable a stub implementation by undefining _WASI_STRICT_PTHREAD"); 0;})
+#endif
+#endif
 
 #ifdef __GNUC__
 __attribute__((const))
@@ -232,8 +242,13 @@ int pthread_setname_np(pthread_t, const char *);
 int pthread_getname_np(pthread_t, char *, size_t);
 int pthread_getattr_default_np(pthread_attr_t *);
 int pthread_setattr_default_np(const pthread_attr_t *);
+#if defined(__wasilibc_unmodified_upstream) || defined(_REENTRANT) || !defined(_WASI_STRICT_PTHREAD)
 int pthread_tryjoin_np(pthread_t, void **);
 int pthread_timedjoin_np(pthread_t, void **, const struct timespec *);
+#else
+#define pthread_tryjoin_np(...) ({ _Static_assert(0, "This function is not available on a single-threaded target; switch to a multi-threaded target with -pthread or enable a stub implementation by undefining _WASI_STRICT_PTHREAD"); 0;})
+#define pthread_timedjoin_np(...) ({ _Static_assert(0, "This function is not available on a single-threaded target; switch to a multi-threaded target with -pthread or enable a stub implementation by undefining _WASI_STRICT_PTHREAD"); 0;})
+#endif
 #endif
 
 #if _REDIR_TIME64
